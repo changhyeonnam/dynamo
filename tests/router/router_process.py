@@ -160,6 +160,16 @@ class FrontendRouterProcess(ManagedProcess):
         """Check if KV, random, round-robin, or direct router is ready"""
         return response.status_code == 200
 
+    def send_signal(self, sig: int) -> int:
+        """Send a signal to the frontend OS process (e.g. to simulate a
+        router replica crash). Returns the signalled PID.
+        """
+        if self.proc is None:
+            raise RuntimeError("send_signal requires a started frontend process")
+        pid = self.proc.pid
+        os.kill(pid, sig)
+        return pid
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         super().__exit__(exc_type, exc_val, exc_tb)
 

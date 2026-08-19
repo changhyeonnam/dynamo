@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import signal
 import sys
 import tempfile
 from pathlib import Path
@@ -25,6 +26,7 @@ from tests.router.common import (
     _test_disagg_direct_mode,
     _test_disagg_router_overload_529,
     _test_disagg_topology_required_prefill_pin_match_and_mismatch,
+    _test_kv_router_replica_failure,
     _test_python_router_bindings,
     _test_remote_indexer_decisions,
     _test_router_decisions_disagg_round_robin_prefill_dp_rank,
@@ -593,6 +595,47 @@ def test_mocker_two_kv_router(
             test_payload=TEST_PAYLOAD,
             num_requests=NUM_REQUESTS,
             store_backend=store_backend,
+        )
+
+
+@pytest.mark.timeout(
+    240
+)  # readiness for two routers dominates; kill/serve phases are bounded polls
+@pytest.mark.parametrize(
+    "kill_signal",
+    [signal.SIGKILL, signal.SIGTERM],
+    ids=["sigkill", "sigterm"],
+)
+def test_mocker_kv_router_replica_failure(
+    request,
+    runtime_services_dynamic_ports,
+    predownload_tokenizers,
+    kill_signal,
+):
+    """A killed router replica must not degrade its peer: the survivor keeps
+    serving warmed and fresh prompts. See _test_kv_router_replica_failure.
+    """
+    logger.info("Starting KV router replica failure test: kill_signal=%s", kill_signal)
+
+    mocker_args = {
+        "speedup_ratio": SPEEDUP_RATIO,
+        "block_size": BLOCK_SIZE,
+    }
+
+    with MockerProcess(
+        request,
+        mocker_args=mocker_args,
+        num_mockers=NUM_MOCKERS,
+    ) as mockers:
+        router_ports = allocate_frontend_ports(request, 2)
+
+        _test_kv_router_replica_failure(
+            engine_workers=mockers,
+            block_size=BLOCK_SIZE,
+            request=request,
+            router_ports=router_ports,
+            test_payload=TEST_PAYLOAD,
+            kill_signal=kill_signal,
         )
 
 

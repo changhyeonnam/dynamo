@@ -549,6 +549,117 @@ def _test_router_two_routers(
             kv_router.__exit__(None, None, None)
 
 
+def _test_kv_router_replica_failure(
+    *,
+    engine_workers,
+    block_size: int,
+    request,
+    router_ports: list[int],
+    test_payload: dict,
+    kill_signal: int,
+    num_requests: int = 20,
+    store_backend: str = "etcd",
+    down_timeout: float = 30.0,
+):
+    """KV router replica failure: one of two router replicas dies mid-serving.
+
+    Starts two KV router frontends over the same workers, serves traffic
+    through both, kills one replica's process, then asserts:
+
+    1. the killed replica actually stops accepting connections (the fault
+       landed), and
+    2. the surviving replica serves a full batch of requests successfully —
+       both the already-warmed payload and a previously-unseen prompt, so
+       serving and routing continue for new work after the peer's death.
+
+    Router replicas are independent readers of discovery and KV events; one
+    replica's crash must not degrade the other. kill_signal is SIGKILL for a
+    crash or SIGTERM for a shutdown.
+    """
+    assert len(router_ports) == 2, "replica failure scenario needs two routers"
+
+    routers: list[KVRouterProcess] = []
+    try:
+        for port in router_ports:
+            router = KVRouterProcess(
+                request,
+                block_size,
+                port,
+                engine_workers.namespace,
+                store_backend,
+                min_initial_workers=engine_workers.num_workers,
+            )
+            router.__enter__()
+            routers.append(router)
+
+        for port in router_ports:
+            asyncio.run(
+                wait_for_frontend_ready(
+                    frontend_url=f"http://localhost:{port}",
+                    expected_num_workers=engine_workers.num_workers,
+                    timeout=120,
+                    engine_workers=engine_workers,
+                    store_backend=store_backend,
+                )
+            )
+
+        urls = [f"http://localhost:{port}/v1/chat/completions" for port in router_ports]
+
+        # Phase 1: both replicas serve.
+        asyncio.run(send_inflight_requests(urls, test_payload, num_requests))
+
+        victim, survivor = routers[0], routers[1]
+        victim.send_signal(kill_signal)
+
+        # 1. The victim must actually stop accepting connections.
+        async def _wait_victim_down():
+            deadline = time.monotonic() + down_timeout
+            while time.monotonic() < deadline:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            f"http://localhost:{victim.port}/v1/models",
+                            timeout=aiohttp.ClientTimeout(total=2),
+                        ):
+                            pass
+                except aiohttp.ClientConnectionError:
+                    return
+                except asyncio.TimeoutError:
+                    pass
+                await asyncio.sleep(0.5)
+            raise AssertionError(
+                f"Killed router replica on port {victim.port} still accepts "
+                f"connections after {down_timeout}s"
+            )
+
+        asyncio.run(_wait_victim_down())
+        logger.info("Victim router replica on port %s is down", victim.port)
+
+        # 2. The survivor keeps serving: warmed payload, then a
+        #    previously-unseen prompt (new work still gets routed post-kill).
+        survivor_url = [f"http://localhost:{survivor.port}/v1/chat/completions"]
+        asyncio.run(send_inflight_requests(survivor_url, test_payload, num_requests))
+
+        fresh_payload = {
+            **test_payload,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "replica failover fresh prefix " + uuid.uuid4().hex,
+                }
+            ],
+        }
+        asyncio.run(send_inflight_requests(survivor_url, fresh_payload, num_requests))
+        logger.info(
+            "Survivor router replica on port %s served %s requests after the kill",
+            survivor.port,
+            num_requests * 2,
+        )
+    finally:
+        for router in routers:
+            router.__exit__(None, None, None)
+
+
 def _test_session_affinity(
     engine_workers,
     block_size: int,
