@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import random
+import signal
 import threading
 import time
 import uuid
@@ -1294,6 +1295,194 @@ def _test_kv_router_worker_failure(
             )
         )
         logger.info("Prefix re-cached on survivor; worker failure lifecycle complete")
+
+
+def _test_kv_router_worker_rejoin(
+    *,
+    request,
+    mocker_process_cls,
+    mocker_args: dict,
+    block_size: int,
+    model_name: str,
+    request_plane: str = "nats",
+    seed_blocks: int = 4,
+    convergence_timeout: float = 60.0,
+):
+    """KV router worker-rejoin lifecycle: crash, replace, re-serve.
+
+    The pod-restart path: two workers serve one endpoint, the worker owning a
+    seeded prefix is SIGKILLed, the router converges to the survivor, and a
+    replacement worker then joins the same endpoint. Asserts through stable
+    surfaces (`client.instance_ids()`, `KvRouter.get_overlap_scores`,
+    pinned-request success):
+
+    1. the replacement appears in the instance list alongside the survivor
+       (under a fresh worker id),
+    2. the replacement is servable — a request pinned to it via `worker_id`
+       succeeds,
+    3. the replacement's KV events reach the router inventory — a fresh
+       prefix it served gains overlap-score blocks attributed to its id.
+
+    Args mirror `_test_kv_router_worker_failure`; the kill is always SIGKILL
+    because rejoin-after-crash is the replacement path being validated.
+    """
+    namespace = f"test-namespace-{uuid.uuid4().hex[:8]}"
+    seed_token_ids = list(range(1000, 1000 + block_size * seed_blocks))
+    fresh_token_ids = list(range(5000, 5000 + block_size * seed_blocks))
+
+    async def _poll(describe: str, condition, timeout: float):
+        deadline = time.monotonic() + timeout
+        last = None
+        while time.monotonic() < deadline:
+            last = await condition()
+            if last:
+                return last
+            await asyncio.sleep(0.5)
+        raise AssertionError(
+            f"Timed out after {timeout}s waiting for {describe} (last={last})"
+        )
+
+    async def _overlap_rows(kv_router, token_ids) -> dict[tuple[int, int], int]:
+        scores = await kv_router.get_overlap_scores(token_ids, include_shared=False)
+        return {
+            (row["worker_id"], row["dp_rank"]): row["device_blocks"]
+            for row in scores["workers"]
+        }
+
+    with contextlib.ExitStack() as stack:
+        mocker_a = stack.enter_context(
+            mocker_process_cls(
+                request,
+                mocker_args=mocker_args,
+                num_mockers=1,
+                request_plane=request_plane,
+                namespace=namespace,
+                display_name="dynamo-mocker-a",
+            )
+        )
+        runtime = stack.enter_context(managed_runtime(request_plane=request_plane))
+        endpoint = runtime.endpoint(f"{namespace}.mocker.generate")
+
+        ids_a = asyncio.run(poll_for_worker_instances(endpoint, 1))
+        worker_a = ids_a[0]
+
+        mocker_b = stack.enter_context(
+            mocker_process_cls(
+                request,
+                mocker_args=mocker_args,
+                num_mockers=1,
+                request_plane=request_plane,
+                namespace=namespace,
+                display_name="dynamo-mocker-b",
+            )
+        )
+        all_ids = asyncio.run(poll_for_worker_instances(endpoint, 2))
+        (worker_b,) = set(all_ids) - {worker_a}
+        process_by_worker = {worker_a: mocker_a, worker_b: mocker_b}
+
+        kv_router = _create_kv_router_with_timeout(
+            router_factory=lambda: KvRouter(
+                endpoint=endpoint,
+                block_size=block_size,
+                kv_router_config=KvRouterConfig(),
+            ),
+            num_workers=2,
+            engine_workers=mocker_a,
+        )
+        asyncio.run(wait_for_workers_ready(endpoint, kv_router, 2, model_name))
+
+        # Seed a prefix and find its owner: that worker is the crash victim.
+        asyncio.run(
+            send_request_via_python_kv_router(
+                kv_python_router=kv_router,
+                model_name=model_name,
+                token_ids=seed_token_ids,
+                stop_conditions={"ignore_eos": True, "max_tokens": 8},
+            )
+        )
+
+        async def _find_owner():
+            rows = await _overlap_rows(kv_router, seed_token_ids)
+            owners = {wid for (wid, _), blocks in rows.items() if blocks >= seed_blocks}
+            return owners.pop() if len(owners) == 1 else None
+
+        victim_id = asyncio.run(
+            _poll("seeded prefix to appear on exactly one worker", _find_owner, 30.0)
+        )
+        survivor_id = worker_b if victim_id == worker_a else worker_a
+        logger.info("Crash victim: %s, survivor: %s", victim_id, survivor_id)
+
+        process_by_worker[victim_id].send_signal(signal.SIGKILL)
+
+        async def _victim_deregistered():
+            client = await endpoint.client()
+            return set(client.instance_ids()) == {survivor_id}
+
+        asyncio.run(
+            _poll(
+                f"instance list to converge to survivor {survivor_id}",
+                _victim_deregistered,
+                convergence_timeout,
+            )
+        )
+
+        # The replacement worker joins the same endpoint.
+        stack.enter_context(
+            mocker_process_cls(
+                request,
+                mocker_args=mocker_args,
+                num_mockers=1,
+                request_plane=request_plane,
+                namespace=namespace,
+                display_name="dynamo-mocker-c",
+            )
+        )
+
+        # 1. The replacement must appear beside the survivor, under a new id.
+        async def _replacement_registered():
+            client = await endpoint.client()
+            ids = set(client.instance_ids())
+            if len(ids) == 2 and survivor_id in ids and victim_id not in ids:
+                (new_id,) = ids - {survivor_id}
+                return new_id
+            return None
+
+        replacement_id = asyncio.run(
+            _poll(
+                "replacement worker to register beside the survivor",
+                _replacement_registered,
+                convergence_timeout,
+            )
+        )
+        logger.info("Replacement worker registered: %s", replacement_id)
+
+        # 2. The replacement must be servable: pin a fresh prefix to it.
+        asyncio.run(
+            send_request_via_python_kv_router(
+                kv_python_router=kv_router,
+                model_name=model_name,
+                token_ids=fresh_token_ids,
+                stop_conditions={"ignore_eos": True, "max_tokens": 8},
+                worker_id=replacement_id,
+            )
+        )
+
+        # 3. Its KV events must reach the router inventory.
+        async def _replacement_owns_fresh_prefix():
+            rows = await _overlap_rows(kv_router, fresh_token_ids)
+            return any(
+                wid == replacement_id and blocks >= seed_blocks
+                for (wid, _), blocks in rows.items()
+            )
+
+        asyncio.run(
+            _poll(
+                f"fresh prefix to appear on replacement {replacement_id}",
+                _replacement_owns_fresh_prefix,
+                30.0,
+            )
+        )
+        logger.info("Replacement worker serving and indexed; rejoin lifecycle complete")
 
 
 def _test_router_query_instance_id(

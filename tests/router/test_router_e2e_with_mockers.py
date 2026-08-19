@@ -27,6 +27,7 @@ from tests.router.common import (
     _test_disagg_router_overload_529,
     _test_disagg_topology_required_prefill_pin_match_and_mismatch,
     _test_kv_router_worker_failure,
+    _test_kv_router_worker_rejoin,
     _test_python_router_bindings,
     _test_remote_indexer_decisions,
     _test_router_decisions_disagg_round_robin_prefill_dp_rank,
@@ -737,7 +738,9 @@ def test_kv_router_bindings(
         )
 
 
-@pytest.mark.timeout(240)  # covers worst-case polling budgets (~210s); ~10-20s observed per variant
+@pytest.mark.timeout(
+    240
+)  # covers worst-case polling budgets (~210s); ~10-20s observed per variant
 @pytest.mark.parametrize(
     "kill_signal",
     [signal.SIGKILL, signal.SIGTERM],
@@ -766,6 +769,32 @@ def test_mocker_kv_router_worker_failure(
         block_size=BLOCK_SIZE,
         model_name=MODEL_NAME,
         kill_signal=kill_signal,
+    )
+
+
+@pytest.mark.timeout(300)  # covers worst-case polling budgets (~250s); ~20-30s observed
+@pytest.mark.parametrize("request_plane", ["nats"], indirect=True)
+def test_mocker_kv_router_worker_rejoin(
+    request,
+    runtime_services_dynamic_ports,
+    predownload_tokenizers,
+    request_plane,
+):
+    """A replacement worker joining after a crash must register under a fresh
+    id, serve pinned requests, and get its KV events indexed by the router.
+    See _test_kv_router_worker_rejoin.
+    """
+    logger.info("Starting KV router worker rejoin test")
+
+    _test_kv_router_worker_rejoin(
+        request=request,
+        mocker_process_cls=MockerProcess,
+        mocker_args={
+            "speedup_ratio": SPEEDUP_RATIO,
+            "block_size": BLOCK_SIZE,
+        },
+        block_size=BLOCK_SIZE,
+        model_name=MODEL_NAME,
     )
 
 
